@@ -1,0 +1,1693 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FDEP Well Data Mapper</title>
+    
+    <!-- Tailwind CSS for modern styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Leaflet CSS for Map -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    
+    <!-- Chart.js for Line Graphs -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+
+    <style>
+        /* ── Map-lock scaling variables ──────────────────────────────
+           --zoom-scale   : 2^(zoom - referenceZoom); locks annotations
+                            to the base map so they keep a constant size
+                            RELATIVE TO THE MAP at every zoom level.
+           --callout-scale: user slider multiplier for callout boxes.
+           --label-fs      : base font size (px, unitless number) for well labels. */
+        :root {
+            --zoom-scale: 1;
+            --callout-scale: 1;
+            --point-scale: 1;
+            --label-fs: 13;
+        }
+
+        /* Well marker dots: map-locked like the callouts so their size holds
+           constant RELATIVE TO THE MAP at every zoom, and so the PDF export
+           (which uses the same size law) matches the on-screen view. Scaled
+           from center since the marker is center-anchored. */
+        .well-dot {
+            width: 16px; height: 16px; border-radius: 50%;
+            background: #2563eb; border: 2px solid #fff;
+            box-shadow: 0 0 4px rgba(0,0,0,0.5);
+            transform: scale(calc(var(--zoom-scale) * var(--point-scale)));
+            transform-origin: center center;
+            pointer-events: auto;
+        }
+        /* Same hit-area fix as callouts: only the visible dot is clickable. */
+        .custom-div-icon { pointer-events: none !important; background: transparent; border: none; }
+
+        /* Callout boxes: scale the inner box (never the Leaflet marker
+           container, which Leaflet positions via its own transform).
+           transform-origin top-left keeps the leader-line anchor fixed. */
+        .callout-scale-box {
+            transform: scale(calc(var(--zoom-scale) * var(--callout-scale)));
+            transform-origin: top left;
+        }
+
+        /* Hit-area fix: the Leaflet icon CONTAINER is sized to the callout's
+           UNSCALED layout box, so when a callout is zoomed/scaled down the
+           container leaves a transparent-but-draggable margin around the
+           visible box — clicking that margin "nowhere near" the box grabbed it.
+           Make the container click-through and let ONLY the visible (scaled)
+           box receive pointer events, so the hit area matches what's on screen. */
+        .custom-callout-icon { pointer-events: none !important; }
+        .callout-scale-box   { pointer-events: auto; }
+
+        /* Well name labels: base size controlled by slider (screen-fixed
+           for readability). Font-size via calc avoids fighting Leaflet's
+           tooltip positioning transform. */
+        .well-tooltip {
+            font-size: calc(var(--label-fs) * 1px) !important;
+            line-height: 1.2 !important;
+            padding: calc(var(--label-fs) * 0.3px) calc(var(--label-fs) * 0.6px) !important;
+        }
+
+        /* Custom scrollbar */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #f1f1f1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        
+        #map { background-color: #e2e8f0; cursor: crosshair; }
+        
+        .well-tooltip {
+            background-color: #1e293b; color: white; border: none;
+            border-radius: 4px; font-weight: bold; padding: 4px 8px;
+            box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1); transition: opacity 0.2s;
+        }
+        .well-tooltip::before { border-top-color: #1e293b; }
+        .hide-well-labels .well-tooltip { display: none !important; opacity: 0 !important; }
+        .custom-callout-icon { background: transparent !important; border: none !important; }
+        
+        #dataPanelContent { transition: height 0.3s ease, padding 0.3s ease; }
+        .collapsed-panel { height: 0 !important; padding-top: 0 !important; padding-bottom: 0 !important; overflow: hidden !important; border: none !important; }
+        
+        .viewer-mode header, .viewer-mode aside { display: none !important; }
+        .viewer-mode #map { cursor: grab; }
+    </style>
+</head>
+<body class="bg-slate-50 h-screen flex flex-col font-sans text-slate-800">
+
+    <!-- Header -->
+    <header class="bg-blue-900 text-white p-4 shadow-md flex justify-between items-center shrink-0 z-20 relative transition-all">
+        <div class="flex items-center gap-3">
+            <i data-lucide="map" class="w-6 h-6"></i>
+            <h1 class="text-xl font-bold tracking-wide">Petroleum Restoration Program - Well Mapper</h1>
+        </div>
+        <div id="envStatus" class="text-sm text-blue-200">Local Environment</div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="flex-1 flex overflow-hidden">
+        
+        <!-- Sidebar Controls -->
+        <aside class="w-80 bg-white shadow-lg z-10 flex flex-col shrink-0 overflow-y-auto border-r border-slate-200">
+            <div class="p-5 space-y-6">
+                <!-- Step 1 -->
+                <div class="space-y-2">
+                    <h3 class="font-bold text-slate-700 flex items-center gap-2">
+                        <span class="bg-blue-100 text-blue-700 rounded-full w-6 h-6 flex items-center justify-center text-sm">1</span>
+                        Upload Site Map
+                    </h3>
+                    <p class="text-xs text-slate-500 mb-2">Select an image file (PNG, JPG) or PDF of the site map to use as your canvas.</p>
+                    <label class="flex flex-col items-center justify-center w-full h-20 border-2 border-slate-300 border-dashed rounded-lg cursor-pointer bg-slate-50 hover:bg-slate-100 transition">
+                        <div class="flex flex-col items-center justify-center pt-3 pb-4">
+                            <i data-lucide="image-plus" class="w-5 h-5 text-slate-400 mb-1"></i>
+                            <p class="text-sm text-slate-500 font-medium">Click to upload map</p>
+                        </div>
+                        <input id="imageUpload" type="file" accept="image/*,.pdf" class="hidden" />
+                    </label>
+                    <div id="imageStatus" class="text-xs text-emerald-600 hidden flex items-center gap-1 mt-1">
+                        <i data-lucide="check-circle-2" class="w-4 h-4"></i> Map loaded successfully
+                    </div>
+                </div>
+
+                <!-- Step 2 -->
+                <div class="space-y-2">
+                    <h3 class="font-bold text-slate-700 flex items-center gap-2">
+                        <span class="bg-blue-100 text-blue-700 rounded-full w-6 h-6 flex items-center justify-center text-sm">2</span>
+                        Upload CSV Data
+                    </h3>
+                    <p class="text-xs text-slate-500 mb-2">Upload the FDEP ADaPT CSV export. New uploads will append to existing data.</p>
+                    <label class="flex flex-col items-center justify-center w-full h-20 border-2 border-slate-300 border-dashed rounded-lg cursor-pointer bg-slate-50 hover:bg-slate-100 transition">
+                        <div class="flex flex-col items-center justify-center pt-3 pb-4">
+                            <i data-lucide="file-spreadsheet" class="w-5 h-5 text-slate-400 mb-1"></i>
+                            <p class="text-sm text-slate-500 font-medium">Click to append CSV</p>
+                        </div>
+                        <input id="csvUpload" type="file" accept=".csv" class="hidden" />
+                    </label>
+                    <div id="csvStatus" class="text-xs text-emerald-600 hidden flex flex-col gap-1 mt-1">
+                        <div class="flex items-center gap-1"><i data-lucide="check-circle-2" class="w-4 h-4"></i> <span id="csvCount">0</span> total records loaded</div>
+                    </div>
+                </div>
+
+                <!-- Step 3 -->
+                <div class="bg-blue-50 p-3 rounded-lg border border-blue-100">
+                    <h3 class="font-bold text-blue-900 flex items-center gap-2 mb-2 text-sm">
+                        <i data-lucide="info" class="w-4 h-4"></i> Instructions
+                    </h3>
+                    <ul class="text-xs text-blue-800 space-y-1.5 list-disc pl-4">
+                        <li><strong>Click anywhere on the map</strong> to place a new well marker.</li>
+                        <li>Assign the <code>TestSite Name</code> from the dropdown.</li>
+                        <li><strong>Click an existing marker</strong> to view data, or click analytes in the table for graphs.</li>
+                    </ul>
+                </div>
+
+                <!-- Step 4 -->
+                <div class="space-y-3 pt-4 border-t border-slate-200">
+                    <h3 class="font-bold text-slate-700 flex items-center gap-2">
+                        <span class="bg-blue-100 text-blue-700 rounded-full w-6 h-6 flex items-center justify-center text-sm">4</span>
+                        Export & Save
+                    </h3>
+                    <button onclick="exportCSV()" class="w-full flex items-center justify-center gap-2 px-4 py-2 bg-slate-100 hover:bg-slate-200 border border-slate-300 text-slate-700 text-sm font-semibold rounded-lg transition">
+                        <i data-lucide="download" class="w-4 h-4"></i> Export Merged CSV
+                    </button>
+                    <button onclick="generatePDF()" class="w-full flex items-center justify-center gap-2 px-4 py-2 bg-red-50 hover:bg-red-100 border border-red-200 text-red-700 text-sm font-semibold rounded-lg transition">
+                        <i data-lucide="file-text" class="w-4 h-4"></i> Export Map to PDF
+                    </button>
+                    <button onclick="exportHTML(false)" class="w-full flex items-center justify-center gap-2 px-4 py-2 bg-blue-50 hover:bg-blue-100 border border-blue-200 text-blue-700 text-sm font-semibold rounded-lg transition">
+                        <i data-lucide="save" class="w-4 h-4"></i> Save Full Session
+                    </button>
+                    <div class="pt-2">
+                        <label class="flex items-center gap-2 cursor-pointer mb-2 px-1">
+                            <input type="checkbox" id="hideFloatingControlsExport" class="w-4 h-4 text-blue-600 rounded focus:ring-blue-500">
+                            <span class="text-xs font-medium text-slate-600">Hide Label/Callout Controls</span>
+                        </label>
+                        <button onclick="exportHTML(true)" class="w-full flex items-center justify-center gap-2 px-4 py-2 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-700 text-sm font-semibold rounded-lg transition">
+                            <i data-lucide="monitor-play" class="w-4 h-4"></i> Export Clean Viewer
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Right Column: Map & Data Table -->
+        <div class="flex-1 flex flex-col relative">
+            
+            <!-- Floating Map Controls -->
+            <div id="floatingControls" class="absolute top-4 left-4 z-[500] bg-white/90 backdrop-blur shadow-lg border border-slate-200 rounded-lg p-3 flex flex-col gap-3 hidden">
+                <div class="flex items-center justify-between gap-4">
+                    <span class="text-sm font-semibold text-slate-700">Point Labels:</span>
+                    <label class="relative inline-flex items-center cursor-pointer">
+                        <input type="checkbox" id="labelToggle" class="sr-only peer" checked>
+                        <div class="w-8 h-4 bg-slate-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-blue-600"></div>
+                    </label>
+                </div>
+                <div class="flex items-center justify-between gap-4 pt-2 border-t border-slate-200">
+                    <span class="text-sm font-semibold text-slate-700 flex items-center gap-1">Callouts:</span>
+                    <label class="relative inline-flex items-center cursor-pointer">
+                        <input type="checkbox" id="calloutToggle" class="sr-only peer">
+                        <div class="w-8 h-4 bg-slate-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-blue-600"></div>
+                    </label>
+                </div>
+
+                <!-- Size steppers (unbounded +/-) -->
+                <div id="sizeSteppers" class="flex flex-col gap-2 pt-2 border-t border-slate-200">
+                    <div class="flex items-center justify-between gap-2">
+                        <span class="text-xs font-semibold text-slate-600 shrink-0">Point Size</span>
+                        <div class="flex items-center gap-1">
+                            <button id="pointMinus" title="Smaller points" class="w-6 h-6 flex items-center justify-center rounded border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 font-bold leading-none">−</button>
+                            <span id="pointSizeVal" class="text-xs text-slate-600 w-10 text-center tabular-nums">1.0×</span>
+                            <button id="pointPlus" title="Larger points" class="w-6 h-6 flex items-center justify-center rounded border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 font-bold leading-none">+</button>
+                        </div>
+                    </div>
+                    <div class="flex items-center justify-between gap-2">
+                        <span class="text-xs font-semibold text-slate-600 shrink-0">Label Size</span>
+                        <div class="flex items-center gap-1">
+                            <button id="labelMinus" title="Smaller labels" class="w-6 h-6 flex items-center justify-center rounded border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 font-bold leading-none">−</button>
+                            <span id="labelSizeVal" class="text-xs text-slate-600 w-10 text-center tabular-nums">13px</span>
+                            <button id="labelPlus" title="Larger labels" class="w-6 h-6 flex items-center justify-center rounded border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 font-bold leading-none">+</button>
+                        </div>
+                    </div>
+                    <div class="flex items-center justify-between gap-2">
+                        <span class="text-xs font-semibold text-slate-600 shrink-0">Callout Size</span>
+                        <div class="flex items-center gap-1">
+                            <button id="calloutMinus" title="Smaller callouts" class="w-6 h-6 flex items-center justify-center rounded border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 font-bold leading-none">−</button>
+                            <span id="calloutSizeVal" class="text-xs text-slate-600 w-10 text-center tabular-nums">1.0×</span>
+                            <button id="calloutPlus" title="Larger callouts" class="w-6 h-6 flex items-center justify-center rounded border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 font-bold leading-none">+</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Map Container -->
+            <div id="map" class="flex-1 w-full relative z-0">
+                <div id="mapPlaceholder" class="absolute inset-0 flex items-center justify-center bg-slate-200 z-[400] pointer-events-none transition-opacity duration-300">
+                    <div class="text-center text-slate-400">
+                        <i data-lucide="map" class="w-16 h-16 mx-auto mb-2 opacity-50"></i>
+                        <p class="text-lg font-medium">Please upload a site map image or PDF to begin.</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Data Panel (Bottom) -->
+            <div id="dataPanel" class="bg-white border-t border-slate-200 flex flex-col shrink-0 shadow-[0_-4px_6px_-1px_rgb(0,0,0,0.05)] z-10 transition-all duration-300">
+                
+                <!-- Panel Header -->
+                <div class="bg-slate-100 px-4 py-2 border-b border-slate-200 flex justify-between items-center relative z-20 flex-wrap gap-2">
+                    <div class="flex items-center gap-4">
+                        <h2 id="tableTitle" class="font-bold text-slate-700 flex items-center gap-2 min-w-[200px]">
+                            <i data-lucide="database" class="w-4 h-4"></i> Analytical Data
+                        </h2>
+                        
+                        <div class="flex items-center gap-4 pl-4 border-l border-slate-300">
+                            <!-- View Mode Dropdown -->
+                            <div class="flex items-center gap-2">
+                                <span class="text-sm font-medium text-slate-600">View:</span>
+                                <select id="viewModeSelect" class="text-slate-800 text-sm border border-slate-300 rounded px-2 py-1 outline-none w-48 shadow-sm">
+                                    <option value="location">Location ID Specific</option>
+                                    <option value="mapped">All Location IDs on Map</option>
+                                    <option value="all">All Location IDs</option>
+                                </select>
+                            </div>
+
+                            <!-- Method Filter -->
+                            <div class="flex items-center gap-2 ml-2">
+                                <span class="text-sm font-medium text-slate-600">Method:</span>
+                                <select id="bottomMethodSelect" class="text-slate-800 text-sm border border-slate-300 rounded px-2 py-1 outline-none w-40 shadow-sm">
+                                    <option value="">Select method...</option>
+                                    <option value="All">All</option>
+                                </select>
+                            </div>
+
+                            <!-- Analyte Filter -->
+                            <div class="flex items-center gap-2 ml-2 relative">
+                                <span class="text-sm font-medium text-slate-600">Analyte:</span>
+                                <div class="relative">
+                                    <button id="analyteDropdownBtn" class="bg-white text-slate-800 text-sm border border-slate-300 rounded px-3 py-1 outline-none w-56 shadow-sm flex justify-between items-center hover:bg-slate-50 transition">
+                                        <span id="analyteBtnText" class="truncate">All method analytes</span>
+                                        <i data-lucide="chevron-down" class="w-4 h-4 ml-2 shrink-0"></i>
+                                    </button>
+                                    <!-- Dropdown Menu -->
+                                    <div id="analyteDropdownMenu" class="absolute bottom-[calc(100%+4px)] left-0 w-64 bg-white border border-slate-200 shadow-xl rounded-md hidden z-[1000] overflow-hidden">
+                                        <div class="p-2 border-b border-slate-100 bg-slate-50 space-y-1">
+                                            <label class="flex items-center gap-2 cursor-pointer hover:bg-slate-200 p-1 rounded transition">
+                                                <input type="checkbox" id="selectAllAnalytes" checked class="w-4 h-4 text-blue-600 rounded">
+                                                <span class="text-sm font-bold text-slate-700">All method analytes</span>
+                                            </label>
+                                            <label id="tableCGwRow" class="hidden flex items-center gap-2 cursor-pointer hover:bg-slate-200 p-1 rounded transition">
+                                                <input type="checkbox" id="tableCGwCheckbox" class="w-4 h-4 text-blue-600 rounded">
+                                                <span class="text-sm font-semibold text-slate-700">Table C (GW)</span>
+                                            </label>
+                                        </div>
+                                        <div id="analyteCheckboxes" class="p-2 space-y-1 overflow-y-auto max-h-[250px]">
+                                            <!-- Checkboxes injected here -->
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Hide/Unhide Arrow -->
+                    <button id="togglePanelBtn" class="text-slate-500 hover:text-slate-800 transition p-1 bg-slate-200 hover:bg-slate-300 rounded" title="Hide/Unhide Table">
+                        <i data-lucide="chevron-down" class="w-5 h-5 transform transition-transform" id="panelChevron"></i>
+                    </button>
+                </div>
+                
+                <!-- Panel Content -->
+                <div id="dataPanelContent" class="h-64 overflow-hidden relative bg-slate-50 flex flex-col">
+                    <div id="emptyDataState" class="absolute inset-0 flex flex-col items-center justify-center text-slate-400 bg-white z-30">
+                        <i data-lucide="mouse-pointer-click" class="w-8 h-8 mb-2 opacity-50"></i>
+                        <p>Select a well marker on the map to view detailed data.</p>
+                    </div>
+
+                    <!-- Horizontally scrollable wrapper -->
+                    <div class="flex-1 overflow-auto px-4 pb-4 pt-0 w-full h-full min-w-0 min-h-0">
+                        <table id="dataTable" class="text-sm text-left hidden border-collapse bg-white border border-slate-200 shadow-sm w-max">
+                            <thead class="text-xs text-slate-500 bg-slate-100 sticky top-0 shadow-sm z-20"></thead>
+                            <tbody id="dataTableBody" class="divide-y divide-slate-100"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Modal: Add Well -->
+    <div id="addWellModal" class="fixed inset-0 bg-slate-900/50 backdrop-blur-sm hidden items-center justify-center z-[1000] opacity-0 transition-opacity duration-200">
+        <div class="bg-white rounded-xl shadow-xl w-full max-w-md overflow-hidden transform scale-95 transition-transform duration-200" id="addWellModalContent">
+            <div class="px-6 py-4 border-b border-slate-100 flex justify-between items-center">
+                <h3 class="text-lg font-bold text-slate-800">Add Well Location</h3>
+                <button onclick="closeModal()" class="text-slate-400 hover:text-slate-600"><i data-lucide="x" class="w-5 h-5"></i></button>
+            </div>
+            <div class="p-6 space-y-4">
+                <p class="text-sm text-slate-500">Select the TestSite Name from the loaded CSV data to link this point.</p>
+                <div>
+                    <select id="wellNameSelect" class="w-full border border-slate-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition">
+                        <option value="" disabled selected>Select a well...</option>
+                    </select>
+                </div>
+            </div>
+            <div class="px-6 py-4 bg-slate-50 border-t border-slate-100 flex justify-end gap-2">
+                <button onclick="closeModal()" class="px-4 py-2 text-sm font-medium text-slate-600 hover:bg-slate-200 rounded-lg transition">Cancel</button>
+                <button onclick="saveWell()" class="px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg shadow-sm transition">Place Well</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal: Chart -->
+    <div id="chartModal" class="fixed inset-0 bg-slate-900/50 backdrop-blur-sm hidden items-center justify-center z-[2000] opacity-0 transition-opacity duration-200">
+        <div class="bg-white rounded-xl shadow-xl w-full max-w-5xl overflow-hidden transform scale-95 transition-transform duration-200" id="chartModalContent">
+            <div class="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50">
+                <h3 id="chartTitle" class="text-lg font-bold text-slate-800 flex items-center gap-2">
+                    <i data-lucide="line-chart" class="w-5 h-5 text-blue-600"></i> Trend Analysis
+                </h3>
+                <button onclick="closeChartModal()" class="text-slate-400 hover:text-slate-600">
+                    <i data-lucide="x" class="w-5 h-5"></i>
+                </button>
+            </div>
+            <div class="p-6 h-[500px] w-full">
+                <canvas id="chartCanvas"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <div id="toastContainer" class="fixed bottom-4 right-4 flex flex-col gap-2 z-[3000]"></div>
+
+    <!-- Scripts -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script>
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+        lucide.createIcons();
+
+        // Application State
+        const state = {
+            mapReady: false, mapImageSrc: null, csvParsed: false,
+            data: [], recordKeys: new Set(),
+            uniqueWells: new Set(), uniqueMethods: new Set(),
+            markers: {}, callouts: {},
+            crossWellDates: {}, // tracks selected date per well for Cross-Well view
+            pendingCoords: null, selectedWell: null,
+            isCleanViewer: false, panelCollapsed: false,
+            hideFloatingControls: false,
+            referenceZoom: 0,            // zoom at fit-to-bounds; anchor for --zoom-scale
+            calloutScale: 1,            // user callout-size multiplier
+            pointScale: 1,              // user well-dot size multiplier
+            labelFs: 13,                // base well-label font size (px)
+            calloutPositions: {},       // { wellName: {lat,lng} } persisted callout offsets
+            origPdfWidth: 0, origPdfHeight: 0  // original page dims (pt) for PDF export
+        };
+
+        let activeChart = null; // Chart.js instance
+
+        document.addEventListener('DOMContentLoaded', () => {
+            if (window.__SESSION_STATE__) restoreSession(window.__SESSION_STATE__);
+            L.DomEvent.disableClickPropagation(document.getElementById('floatingControls'));
+
+            // Dropdown UI Event Listeners
+            const analyteDropdownBtn = document.getElementById('analyteDropdownBtn');
+            const analyteDropdownMenu = document.getElementById('analyteDropdownMenu');
+
+            analyteDropdownBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                analyteDropdownMenu.classList.toggle('hidden');
+            });
+            document.addEventListener('click', (e) => {
+                if (!analyteDropdownBtn.contains(e.target) && !analyteDropdownMenu.contains(e.target)) {
+                    analyteDropdownMenu.classList.add('hidden');
+                }
+            });
+        });
+
+        function showToast(message, type = 'info') {
+            const container = document.getElementById('toastContainer');
+            const toast = document.createElement('div');
+            let bgClass = type === 'success' ? 'bg-emerald-600' : (type === 'error' ? 'bg-red-600' : 'bg-slate-800');
+            let icon = type === 'success' ? 'check-circle' : (type === 'error' ? 'alert-circle' : 'info');
+
+            toast.className = `${bgClass} text-white px-4 py-3 rounded-lg shadow-lg flex items-center gap-3 text-sm font-medium transform transition-all duration-300 translate-y-10 opacity-0`;
+            toast.innerHTML = `<i data-lucide="${icon}" class="w-4 h-4"></i> ${message}`;
+            container.appendChild(toast);
+            lucide.createIcons({ root: toast });
+
+            setTimeout(() => toast.classList.remove('translate-y-10', 'opacity-0'), 10);
+            setTimeout(() => { toast.classList.add('opacity-0'); setTimeout(() => toast.remove(), 300); }, 3500);
+        }
+
+        function normalizeMethod(methodString) {
+            if (!methodString) return 'Unknown Method';
+            const epaMatch = methodString.match(/EPA\s*\d{4}/i);
+            if (epaMatch) return epaMatch[0].toUpperCase().replace(/EPA\s*/, 'EPA ');
+            return methodString.trim();
+        }
+
+        const map = L.map('map', { crs: L.CRS.Simple, minZoom: -4, maxZoom: 5, zoomControl: true, attributionControl: false });
+        map.zoomControl.setPosition('topright');
+        let imageOverlayLayer = null;
+
+        // ── Map-lock scaling ────────────────────────────────────────
+        // Annotations scale by 2^(zoom - referenceZoom) so they hold a
+        // constant size relative to the base map at every zoom level.
+        function updateZoomScale() {
+            if (!state.mapReady) return;
+            const scale = Math.pow(2, map.getZoom() - state.referenceZoom);
+            document.documentElement.style.setProperty('--zoom-scale', scale);
+        }
+        map.on('zoom', updateZoomScale);
+
+        // Combined callout scale currently applied (zoom-lock × user slider)
+        function effectiveCalloutScale() {
+            return Math.pow(2, map.getZoom() - state.referenceZoom) * state.calloutScale;
+        }
+
+        function applyCalloutScale(v) {
+            v = Math.max(0.1, v);
+            state.calloutScale = v;
+            document.documentElement.style.setProperty('--callout-scale', v);
+            const label = document.getElementById('calloutSizeVal');
+            if (label) label.textContent = v.toFixed(1) + '×';
+            // Box size changed → re-space overlapping callouts
+            resolveCalloutCollisions();
+        }
+
+        function applyLabelSize(v) {
+            v = Math.max(1, v);
+            state.labelFs = v;
+            document.documentElement.style.setProperty('--label-fs', v);
+            const label = document.getElementById('labelSizeVal');
+            if (label) label.textContent = v + 'px';
+        }
+
+        function applyPointScale(v) {
+            v = Math.max(0.1, v);
+            state.pointScale = v;
+            document.documentElement.style.setProperty('--point-scale', v);
+            const label = document.getElementById('pointSizeVal');
+            if (label) label.textContent = v.toFixed(1) + '×';
+        }
+
+        // Unbounded steppers: increase indefinitely, floor at a small positive size.
+        function nudgeCallout(delta) {
+            applyCalloutScale(Math.round((state.calloutScale + delta) * 10) / 10);
+        }
+        function nudgeLabel(delta) {
+            applyLabelSize(state.labelFs + delta);
+        }
+        function nudgePoint(delta) {
+            applyPointScale(Math.round((state.pointScale + delta) * 10) / 10);
+        }
+
+        document.getElementById('calloutPlus').addEventListener('click', () => nudgeCallout(0.1));
+        document.getElementById('calloutMinus').addEventListener('click', () => nudgeCallout(-0.1));
+        document.getElementById('labelPlus').addEventListener('click', () => nudgeLabel(1));
+        document.getElementById('labelMinus').addEventListener('click', () => nudgeLabel(-1));
+        document.getElementById('pointPlus').addEventListener('click', () => nudgePoint(0.1));
+        document.getElementById('pointMinus').addEventListener('click', () => nudgePoint(-0.1));
+
+        // Leaflet's L.Draggable starts a drag on the middle mouse button too
+        // (its guard allows e.button === 1), so a scroll-wheel click over a
+        // callout would move it. Swallow any non-left mousedown that lands on a
+        // callout box before it reaches Leaflet's drag handler.
+        document.addEventListener('mousedown', function(e) {
+            if (e.button !== 0 && e.target.closest && e.target.closest('.callout-scale-box, .well-dot')) {
+                e.stopPropagation();
+            }
+        }, true);
+
+        document.getElementById('labelToggle').addEventListener('change', function(e) {
+            const mapContainer = document.getElementById('map');
+            if (e.target.checked) mapContainer.classList.remove('hide-well-labels');
+            else mapContainer.classList.add('hide-well-labels');
+        });
+
+        // ── Table C (GW) quick-select ────────────────────────────────
+        // Preset groundwater analyte group. Shown only under Method: All.
+        // Checking it selects whichever of these analytes are present.
+        const TABLE_C_GW = [
+            'Benzene', 'Toluene', 'Ethylbenzene', 'Xylenes- Total', 'Methyl-t-butyl ether',
+            'Total Recoverable Pet. Hydrocarbons', 'Lead', 'Naphthalene',
+            '1-Methylnaphthalene', '2-Methylnaphthalene'
+        ];
+        const _normAnalyte = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+        const TABLE_C_GW_KEYS = new Set(TABLE_C_GW.map(_normAnalyte));
+        // Common naming variants so near-matches still resolve
+        ['methyltertbutylether', 'mtbe'].forEach(k => TABLE_C_GW_KEYS.add(k));
+        ['totalrecoverablepetroleumhydrocarbons', 'trph'].forEach(k => TABLE_C_GW_KEYS.add(k));
+        ['totalxylenes', 'xylenestotal'].forEach(k => TABLE_C_GW_KEYS.add(k));
+
+        function _tableCGwMembers() {
+            return Array.from(document.querySelectorAll('.analyte-cb'))
+                .filter(cb => TABLE_C_GW_KEYS.has(_normAnalyte(cb.value)));
+        }
+
+        // Reflect the Table C checkbox state from the individual boxes
+        function syncTableCGwState() {
+            const cb = document.getElementById('tableCGwCheckbox');
+            if (!cb) return;
+            const members = _tableCGwMembers();
+            cb.checked = members.length > 0 && members.every(m => m.checked);
+        }
+
+        // Toggle every present Table C analyte on/off
+        function applyTableCGw(checked) {
+            _tableCGwMembers().forEach(cb => { cb.checked = checked; });
+            const anyChecked = Array.from(document.querySelectorAll('.analyte-cb')).some(c => c.checked);
+            document.getElementById('selectAllAnalytes').checked = !anyChecked;
+            syncTableCGwState();
+            updateAnalyteButtonText();
+            renderActiveTable();
+            refreshCallouts();
+        }
+
+        // Wire once — the checkbox is static in the DOM
+        (function initTableCGw() {
+            const cb = document.getElementById('tableCGwCheckbox');
+            if (cb) cb.addEventListener('change', e => applyTableCGw(e.target.checked));
+        })();
+
+        // Analyte Filtering Logic
+        function populateAnalyteDropdown() {
+            const method = document.getElementById('bottomMethodSelect').value;
+            const container = document.getElementById('analyteCheckboxes');
+            const selectAllCb = document.getElementById('selectAllAnalytes');
+            const tableCRow = document.getElementById('tableCGwRow');
+            container.innerHTML = '';
+            
+            if (!method) {
+                if (tableCRow) tableCRow.classList.add('hidden');
+                updateAnalyteButtonText();
+                return;
+            }
+
+            // Get unique analytes for the selected method across all data
+            const validRows = state.data.filter(row => {
+                const rowMethod = normalizeMethod(getCSVValue(row, ['Analytical Method']));
+                return method === 'All' || rowMethod === method;
+            });
+            
+            let uniqueAnalytes = Array.from(new Set(validRows.map(r => getCSVValue(r, ['Analyte'])))).filter(Boolean);
+            uniqueAnalytes = customAnalyteSort(uniqueAnalytes, method);
+
+            uniqueAnalytes.forEach(analyte => {
+                const label = document.createElement('label');
+                label.className = 'flex items-center gap-2 cursor-pointer hover:bg-slate-200 p-1 rounded transition';
+                label.innerHTML = `
+                    <input type="checkbox" value="${analyte}" class="analyte-cb w-4 h-4 text-blue-600 rounded">
+                    <span class="text-sm text-slate-600 truncate" title="${analyte}">${analyte}</span>
+                `;
+                container.appendChild(label);
+            });
+
+            const checkboxes = document.querySelectorAll('.analyte-cb');
+
+            // Table C (GW) is a groundwater group spanning several methods,
+            // so it only makes sense (and only appears) under Method: All.
+            if (tableCRow) tableCRow.classList.toggle('hidden', method !== 'All');
+
+            selectAllCb.addEventListener('change', (e) => {
+                if (e.target.checked) {
+                    checkboxes.forEach(cb => cb.checked = false);
+                    syncTableCGwState();
+                    updateAnalyteButtonText();
+                    renderActiveTable();
+                    refreshCallouts();
+                } else {
+                    e.target.checked = true; // Prevent unchecking if no individuals are selected
+                }
+            });
+
+            checkboxes.forEach(cb => {
+                cb.addEventListener('change', () => {
+                    const anyChecked = Array.from(checkboxes).some(c => c.checked);
+                    selectAllCb.checked = !anyChecked;
+                    syncTableCGwState();
+                    updateAnalyteButtonText();
+                    renderActiveTable();
+                    refreshCallouts();
+                });
+            });
+
+            selectAllCb.checked = true;
+            syncTableCGwState();
+            updateAnalyteButtonText();
+        }
+
+        function updateAnalyteButtonText() {
+            const btnText = document.getElementById('analyteBtnText');
+            const checked = document.querySelectorAll('.analyte-cb:checked');
+            const tableCcb = document.getElementById('tableCGwCheckbox');
+            const tableCRow = document.getElementById('tableCGwRow');
+            const tableCActive = tableCcb && tableCcb.checked && tableCRow && !tableCRow.classList.contains('hidden');
+            if (document.getElementById('selectAllAnalytes').checked || checked.length === 0) {
+                btnText.textContent = 'All method analytes';
+            } else if (tableCActive && checked.length === _tableCGwMembers().length) {
+                btnText.textContent = 'Table C (GW)';
+            } else if (checked.length === 1) {
+                btnText.textContent = checked[0].value;
+            } else {
+                btnText.textContent = `${checked.length} analytes selected`;
+            }
+        }
+
+        function getSelectedAnalytes() {
+            const selectAll = document.getElementById('selectAllAnalytes');
+            if (!selectAll || selectAll.checked) return null; // null means allow all
+            const checked = document.querySelectorAll('.analyte-cb:checked');
+            return Array.from(checked).map(cb => cb.value);
+        }
+
+        function loadMapOverlay(imgSrc) {
+            const img = new Image();
+            img.onload = function() {
+                const bounds = [[0, 0], [img.height, img.width]];
+                if (imageOverlayLayer) map.removeLayer(imageOverlayLayer);
+                
+                imageOverlayLayer = L.imageOverlay(img.src, bounds).addTo(map);
+                map.fitBounds(bounds);
+                state.mapReady = true; state.mapImageSrc = imgSrc;
+
+                // Original page dims for PDF export. PDF uploads set these from the
+                // page's native points; raster images assume 96dpi -> 72pt.
+                if (!state.origPdfWidth || !state.origPdfHeight) {
+                    state.origPdfWidth  = img.width  * 0.75;
+                    state.origPdfHeight = img.height * 0.75;
+                }
+
+                // Anchor zoom scaling to the fit-to-bounds zoom
+                state.referenceZoom = map.getZoom();
+                updateZoomScale();
+                
+                document.getElementById('mapPlaceholder').style.opacity = '0';
+                document.getElementById('imageStatus').classList.remove('hidden');
+                
+                if (!state.hideFloatingControls) {
+                    document.getElementById('floatingControls').classList.remove('hidden');
+                } else {
+                    document.getElementById('floatingControls').classList.add('hidden');
+                }
+
+                if (!state.isCleanViewer) showToast('Site map loaded successfully.', 'success');
+            };
+            img.src = imgSrc;
+        }
+
+        document.getElementById('imageUpload').addEventListener('change', async function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            if (file.type === 'application/pdf') {
+                try {
+                    showToast('Processing PDF map...', 'info');
+                    const arrayBuffer = await file.arrayBuffer();
+                    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+                    const page = await pdf.getPage(1);
+                    const canvas = document.createElement('canvas');
+                    const context = canvas.getContext('2d');
+
+                    // Native page size (pt) for exact PDF page dimensions on export
+                    const vp1 = page.getViewport({ scale: 1 });
+                    state.origPdfWidth  = vp1.width;
+                    state.origPdfHeight = vp1.height;
+
+                    // Increased scale to 5.0 for maximum PDF rendering resolution
+                    const viewport = page.getViewport({ scale: 5.0 });
+                    canvas.height = viewport.height;
+                    canvas.width = viewport.width;
+                    
+                    await page.render({ canvasContext: context, viewport: viewport }).promise;
+                    loadMapOverlay(canvas.toDataURL('image/png'));
+                } catch (error) { showToast('Failed to render PDF.', 'error'); }
+            } else {
+                const reader = new FileReader();
+                reader.onload = function(event) { loadMapOverlay(event.target.result); };
+                reader.readAsDataURL(file);
+            }
+        });
+
+        document.getElementById('csvUpload').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            Papa.parse(file, {
+                header: true, skipEmptyLines: true,
+                complete: function(results) {
+                    let newRowsCount = 0;
+                    const allDates = new Set();
+
+                    results.data.forEach(row => {
+                        const testSite = getCSVValue(row, ['TestSite Name']);
+                        if (!testSite || testSite.trim() === '') return;
+
+                        const fullDate = getCSVValue(row, ['Sample Date']) || '';
+                        const dateOnly = fullDate.split(' ')[0];
+                        if (dateOnly) allDates.add(dateOnly);
+
+                        const analyte = getCSVValue(row, ['Analyte']) || '';
+                        const recordKey = `${fullDate.trim()}|${analyte.trim()}|${testSite.trim()}`;
+
+                        if (!state.recordKeys.has(recordKey)) {
+                            state.recordKeys.add(recordKey);
+                            state.data.push(row);
+                            newRowsCount++;
+                            state.uniqueWells.add(testSite.trim());
+                            const rawMethod = getCSVValue(row, ['Analytical Method']);
+                            if (rawMethod && rawMethod.trim() !== '') state.uniqueMethods.add(normalizeMethod(rawMethod));
+                        }
+                    });
+
+                    populateWellDropdown();
+                    populateMethodDropdown();
+                    state.csvParsed = true;
+                    
+                    document.getElementById('csvStatus').classList.remove('hidden');
+                    document.getElementById('csvCount').textContent = state.data.length.toLocaleString();
+                    
+                    // Force the dropdown to 'All' by default when new data is added
+                    document.getElementById('bottomMethodSelect').value = 'All';
+                    populateAnalyteDropdown(); // Initialize analytes
+
+                    if (newRowsCount > 0) showToast(`Appended ${newRowsCount} records.`, 'success');
+                    else showToast(`No new records added.`, 'info');
+                    
+                    // Auto-trigger Cross-Well view if only 1 date across dataset
+                    if (allDates.size === 1) {
+                        document.getElementById('crossWellToggle').checked = true;
+                    }
+
+                    renderActiveTable();
+                    refreshCallouts();
+                }
+            });
+            e.target.value = ''; 
+        });
+
+        function getCSVValue(row, possibleKeys) {
+            for (let key of Object.keys(row)) if (possibleKeys.includes(key.trim())) return row[key];
+            return null;
+        }
+
+        function populateWellDropdown() {
+            const select = document.getElementById('wellNameSelect');
+            select.innerHTML = '<option value="" disabled selected>Select a well...</option>';
+            Array.from(state.uniqueWells).sort().forEach(well => {
+                const opt = document.createElement('option'); opt.value = well; opt.textContent = well; select.appendChild(opt);
+            });
+        }
+
+        function populateMethodDropdown() {
+            const select = document.getElementById('bottomMethodSelect');
+            const currentVal = select.value;
+            select.innerHTML = '<option value="" disabled selected>Select method...</option><option value="All">All</option>';
+            Array.from(state.uniqueMethods).sort().forEach(method => {
+                const opt = document.createElement('option'); opt.value = method; opt.textContent = method; select.appendChild(opt);
+            });
+            if(currentVal && (state.uniqueMethods.has(currentVal) || currentVal === 'All')) select.value = currentVal;
+        }
+
+        document.getElementById('togglePanelBtn').addEventListener('click', () => {
+            state.panelCollapsed = !state.panelCollapsed;
+            const content = document.getElementById('dataPanelContent');
+            const chevron = document.getElementById('panelChevron');
+            if (state.panelCollapsed) {
+                content.classList.add('collapsed-panel'); chevron.classList.add('-rotate-90');
+            } else {
+                content.classList.remove('collapsed-panel'); chevron.classList.remove('-rotate-90');
+            }
+        });
+
+        map.on('click', function(e) {
+            if (state.isCleanViewer) return;
+            if (!state.mapReady) return showToast('Upload a Site Map first.', 'error');
+            if (!state.csvParsed || state.data.length === 0) return showToast('Upload CSV data first.', 'error');
+
+            state.pendingCoords = e.latlng;
+            document.getElementById('wellNameSelect').value = '';
+            
+            const modal = document.getElementById('addWellModal');
+            modal.style.display = 'flex'; void modal.offsetWidth;
+            modal.classList.replace('opacity-0', 'opacity-100');
+            document.getElementById('addWellModalContent').classList.replace('scale-95', 'scale-100');
+        });
+
+        function closeModal() {
+            const modal = document.getElementById('addWellModal');
+            modal.classList.replace('opacity-100', 'opacity-0');
+            document.getElementById('addWellModalContent').classList.replace('scale-100', 'scale-95');
+            setTimeout(() => { modal.style.display = 'none'; state.pendingCoords = null; }, 200);
+        }
+
+        function saveWell() {
+            const wellName = document.getElementById('wellNameSelect').value;
+            if (!wellName) return showToast('Select a TestSite Name.', 'error');
+            if (state.markers[wellName]) return showToast(`Marker for ${wellName} already exists.`, 'error');
+
+            placeWellOnMap(state.pendingCoords, wellName);
+            closeModal();
+            refreshCallouts(); 
+            showToast(`${wellName} added.`, 'success');
+        }
+
+        function placeWellOnMap(coords, wellName) {
+            const customIcon = L.divIcon({
+                className: 'custom-div-icon',
+                html: `<div class="well-dot"></div>`,
+                iconSize: [16, 16], iconAnchor: [8, 8]
+            });
+            const marker = L.marker(coords, { icon: customIcon, draggable: !state.isCleanViewer }).addTo(map);
+            marker.bindTooltip(wellName, { permanent: true, direction: 'top', offset: [0, -10], className: 'well-tooltip' });
+            
+            marker.on('drag', function() {
+                if (state.callouts[wellName]) {
+                    state.callouts[wellName].line.setLatLngs([marker.getLatLng(), state.callouts[wellName].marker.getLatLng()]);
+                }
+            });
+
+            marker.on('click', function(e) {
+                L.DomEvent.stopPropagation(e);
+                state.selectedWell = wellName;
+                
+                // Auto-focus location id specific view
+                const viewModeSelect = document.getElementById('viewModeSelect');
+                if (viewModeSelect.value !== 'location') {
+                    viewModeSelect.value = 'location';
+                }
+                
+                if(state.panelCollapsed) document.getElementById('togglePanelBtn').click();
+                renderActiveTable(); // Updates bottom panel
+            });
+
+            state.markers[wellName] = marker;
+        }
+
+        // --- Callouts & Table Routing Logic ---
+        document.getElementById('calloutToggle').addEventListener('change', refreshCallouts);
+        
+        document.getElementById('viewModeSelect').addEventListener('change', () => {
+            renderActiveTable();
+        });
+
+        document.getElementById('bottomMethodSelect').addEventListener('change', () => {
+            populateAnalyteDropdown();
+            renderActiveTable();
+            refreshCallouts();
+        });
+
+        // Global function for cross-well date dropdown updates
+        window.updateCrossWellDate = function(wellName, dateString) {
+            state.crossWellDates[wellName] = dateString;
+            renderActiveTable();
+        };
+
+        function renderActiveTable() {
+            const viewMode = document.getElementById('viewModeSelect').value;
+            if (viewMode === 'all') {
+                displayCrossWellData(false);
+            } else if (viewMode === 'mapped') {
+                displayCrossWellData(true);
+            } else {
+                if (state.selectedWell) {
+                    displayWellData(state.selectedWell);
+                } else {
+                    document.getElementById('emptyDataState').classList.remove('hidden');
+                    document.getElementById('dataTable').classList.add('hidden');
+                    document.getElementById('tableTitle').innerHTML = `<i data-lucide="database" class="w-4 h-4"></i> Analytical Data`;
+                    lucide.createIcons({ root: document.getElementById('tableTitle').parentElement });
+                }
+            }
+        }
+
+        function refreshCallouts() {
+            Object.keys(state.callouts).forEach(k => {
+                map.removeLayer(state.callouts[k].marker);
+                map.removeLayer(state.callouts[k].line);
+            });
+            state.callouts = {};
+
+            const toggleOn = document.getElementById('calloutToggle').checked;
+            const selectedMethod = document.getElementById('bottomMethodSelect').value;
+            if (!toggleOn || !selectedMethod) return;
+
+            let restoredAny = false;
+            Object.keys(state.markers).forEach(wellName => {
+                const html = generateCalloutHTML(wellName, selectedMethod);
+                if (!html) return;
+
+                const wellMarker = state.markers[wellName];
+                const cIcon = L.divIcon({
+                    className: 'custom-callout-icon',
+                    html: `<div class="callout-scale-box bg-white/95 backdrop-blur shadow-xl border border-slate-300 rounded-lg p-2 pointer-events-auto cursor-move select-none">${html}</div>`,
+                    iconSize: null, iconAnchor: [0, 0] 
+                });
+
+                // Use a persisted position if one exists (e.g. restored viewer),
+                // otherwise offset up-and-right from the well marker.
+                let startLatLng;
+                const saved = state.calloutPositions[wellName];
+                if (saved) {
+                    startLatLng = L.latLng(saved.lat, saved.lng);
+                    restoredAny = true;
+                } else {
+                    const p = map.latLngToLayerPoint(wellMarker.getLatLng());
+                    startLatLng = map.layerPointToLatLng(L.point(p.x + 25, p.y - 25));
+                }
+
+                const cMarker = L.marker(startLatLng, { icon: cIcon, draggable: true }).addTo(map);
+
+                const line = L.polyline([wellMarker.getLatLng(), cMarker.getLatLng()], {
+                    color: '#64748b', weight: 2, dashArray: '4', interactive: false
+                }).addTo(map);
+
+                cMarker.on('drag', () => { line.setLatLngs([wellMarker.getLatLng(), cMarker.getLatLng()]); });
+                // Persist manual placement so it survives export/restore
+                cMarker.on('dragend', () => {
+                    const ll = cMarker.getLatLng();
+                    state.calloutPositions[wellName] = { lat: ll.lat, lng: ll.lng };
+                });
+                state.callouts[wellName] = { marker: cMarker, line: line };
+            });
+
+            // Only auto-space when we generated fresh positions; respect saved layout.
+            if (!restoredAny) setTimeout(resolveCalloutCollisions, 50); 
+        }
+
+        function resolveCalloutCollisions() {
+            const padding = 15; const iterations = 30;
+            const keys = Object.keys(state.callouts);
+            if(keys.length < 2) return;
+
+            // Callout boxes are visually scaled via CSS transform, but offsetWidth/
+            // offsetHeight report the UNSCALED layout size. Multiply by the current
+            // effective scale so spacing matches what the user actually sees.
+            const s = effectiveCalloutScale();
+
+            for (let k = 0; k < iterations; k++) {
+                let moved = false;
+                for (let i = 0; i < keys.length; i++) {
+                    for (let j = i + 1; j < keys.length; j++) {
+                        const m1 = state.callouts[keys[i]].marker; const m2 = state.callouts[keys[j]].marker;
+                        const el1 = m1.getElement(); const el2 = m2.getElement();
+                        if (!el1 || !el2) continue;
+
+                        const w1 = el1.offsetWidth * s,  h1 = el1.offsetHeight * s;
+                        const w2 = el2.offsetWidth * s,  h2 = el2.offsetHeight * s;
+                        const p1 = map.latLngToLayerPoint(m1.getLatLng()); const p2 = map.latLngToLayerPoint(m2.getLatLng());
+                        const r1 = { left: p1.x, right: p1.x + w1, top: p1.y, bottom: p1.y + h1 };
+                        const r2 = { left: p2.x, right: p2.x + w2, top: p2.y, bottom: p2.y + h2 };
+
+                        if (!(r1.right < r2.left - padding || r1.left > r2.right + padding || r1.bottom < r2.top - padding || r1.top > r2.bottom + padding)) {
+                            const dx = (p1.x + w1/2) - (p2.x + w2/2);
+                            const dy = (p1.y + h1/2) - (p2.y + h2/2);
+                            const dist = Math.sqrt(dx*dx + dy*dy) || 1;
+                            
+                            const pushX = (dx / dist) * 12; const pushY = (dy / dist) * 12;
+                            m1.setLatLng(map.layerPointToLatLng(L.point(p1.x + pushX, p1.y + pushY)));
+                            m2.setLatLng(map.layerPointToLatLng(L.point(p2.x - pushX, p2.y - pushY)));
+                            moved = true;
+                        }
+                    }
+                }
+                if (!moved) break;
+            }
+            keys.forEach(key => {
+                const c = state.callouts[key];
+                c.line.setLatLngs([state.markers[key].getLatLng(), c.marker.getLatLng()]);
+                // Persist resolved positions so export/restore reproduces the layout
+                const ll = c.marker.getLatLng();
+                state.calloutPositions[key] = { lat: ll.lat, lng: ll.lng };
+            });
+        }
+
+        function customAnalyteSort(analyteList, method) {
+            let priorities = [];
+            if (method.includes('EPA 8270')) priorities = ['naphthalene', '1-methylnaphthalene', '2-methylnaphthalene'];
+            else if (method.includes('EPA 8260')) priorities = ['benzene', 'toluene', 'ethylbenzene', 'xylenes- total', 'xylenes-total', 'xylenes, total'];
+
+            return analyteList.sort((a, b) => {
+                const lA = a.toLowerCase(); const lB = b.toLowerCase();
+                let iA = priorities.findIndex(p => lA === p); let iB = priorities.findIndex(p => lB === p);
+                if (iA !== -1 && iB === -1) return -1;
+                if (iB !== -1 && iA === -1) return 1;
+                if (iA !== -1 && iB !== -1) return iA - iB;
+                return lA.localeCompare(lB);
+            });
+        }
+
+        // --- Data Extraction & Rendering ---
+        function getPivotedData(wellName, method) {
+            const selectedAnalytes = getSelectedAnalytes();
+            
+            const rows = state.data.filter(row => {
+                const rowWell = getCSVValue(row, ['TestSite Name']);
+                const rowMethod = normalizeMethod(getCSVValue(row, ['Analytical Method']));
+                const rowAnalyte = getCSVValue(row, ['Analyte']);
+                
+                const matchesMethod = method === 'All' || rowMethod === method;
+                const matchesAnalyte = !selectedAnalytes || selectedAnalytes.includes(rowAnalyte);
+                
+                return rowWell?.trim() === wellName && matchesMethod && matchesAnalyte;
+            });
+            if (rows.length === 0) return null;
+
+            const dateSet = new Set(); const analyteSet = new Set(); const dataMap = {}; 
+            rows.forEach(row => {
+                const dateOnly = (getCSVValue(row, ['Sample Date']) || '').split(' ')[0];
+                if (!dateOnly) return;
+                const analyte = getCSVValue(row, ['Analyte']) || 'Unknown';
+                const result = getCSVValue(row, ['Results', ' Results']) || '';
+                const unit = getCSVValue(row, ['Units', ' Units']) || '';
+                const qual = getCSVValue(row, ['Qualifier']) || '';
+
+                dateSet.add(dateOnly); analyteSet.add(analyte);
+                if (!dataMap[analyte]) dataMap[analyte] = {};
+                dataMap[analyte][dateOnly] = `${result} ${unit} ${qual}`.replace(/\s+/g, ' ').trim();
+            });
+
+            return { dates: Array.from(dateSet).sort((a, b) => new Date(a) - new Date(b)), analytes: customAnalyteSort(Array.from(analyteSet), method), map: dataMap };
+        }
+
+        function generateCalloutHTML(wellName, method) {
+            const pivot = getPivotedData(wellName, method);
+            if (!pivot) return null;
+
+            let html = `
+                <div class="mb-2 border-b border-slate-200 pb-1 cursor-move">
+                    <h4 class="font-bold text-blue-900 text-sm leading-tight">${wellName}</h4>
+                    <p class="text-[10px] text-slate-500 font-semibold uppercase tracking-wider">${method}</p>
+                </div>
+                <div class="max-h-[175px] overflow-y-auto rounded border border-slate-200">
+                    <table class="text-[11px] text-left border-collapse w-max bg-white">
+                        <thead class="bg-slate-50 sticky top-0 z-10 shadow-sm">
+                            <tr><th class="px-2 py-1 font-bold text-slate-700 border-b border-slate-200 border-r">Analyte</th>
+            `;
+            pivot.dates.forEach(date => {
+                html += `<th class="px-2 py-1 font-bold text-slate-700 border-b border-slate-200 border-r whitespace-nowrap text-center">${date}</th>`;
+            });
+            html += `</tr></thead><tbody class="divide-y divide-slate-100">`;
+
+            pivot.analytes.forEach(analyte => {
+                html += `<tr class="hover:bg-blue-50/50"><td class="px-2 py-1 font-medium text-slate-800 border-r border-slate-100">${analyte}</td>`;
+                pivot.dates.forEach(date => {
+                    const val = pivot.map[analyte][date] || 'NS';
+                    const css = val === 'NS' ? 'text-slate-400 italic' : 'text-slate-700 font-medium';
+                    html += `<td class="px-2 py-1 border-r border-slate-100 whitespace-nowrap text-center ${css}">${val}</td>`;
+                });
+                html += `</tr>`;
+            });
+            return html + `</tbody></table></div>`;
+        }
+
+        function displayWellData(wellName) {
+            document.getElementById('emptyDataState').classList.add('hidden');
+            document.getElementById('dataTable').classList.remove('hidden');
+            document.getElementById('tableTitle').innerHTML = `<i data-lucide="map-pin" class="w-5 h-5 text-blue-600"></i> ${wellName} Analytical History`;
+            lucide.createIcons({ root: document.getElementById('tableTitle').parentElement });
+
+            const method = document.getElementById('bottomMethodSelect').value;
+            const thead = document.getElementById('dataTable').querySelector('thead');
+            const tbody = document.getElementById('dataTableBody');
+
+            if (!method) {
+                tbody.innerHTML = `<tr><td class="p-8 text-center text-slate-500 italic">Please select an Active Method to view data.</td></tr>`;
+                thead.innerHTML = ''; return;
+            }
+
+            const pivot = getPivotedData(wellName, method);
+            if (!pivot) {
+                tbody.innerHTML = `<tr><td class="p-8 text-center text-slate-500 italic">No historical data found matching filters at this location.</td></tr>`;
+                thead.innerHTML = ''; return;
+            }
+
+            let headHtml = `<tr><th class="px-4 py-2 font-bold text-slate-700 border-b border-r border-slate-200 bg-slate-100 sticky left-0 z-20 shadow-[2px_0_4px_-1px_rgba(0,0,0,0.05)]">Analyte</th>`;
+            pivot.dates.forEach(date => {
+                headHtml += `<th class="px-4 py-2 font-bold text-slate-700 border-b border-slate-200 whitespace-nowrap text-center">${date}</th>`;
+            });
+            thead.innerHTML = headHtml + `</tr>`;
+
+            let bodyHtml = '';
+            pivot.analytes.forEach(analyte => {
+                bodyHtml += `<tr class="hover:bg-blue-50 transition-colors">
+                    <td class="px-4 py-2 font-medium border-b border-r border-slate-200 bg-white sticky left-0 z-10 shadow-[2px_0_4px_-1px_rgba(0,0,0,0.05)]">
+                        <a href="#" onclick="openChartModal('${analyte}')" class="text-blue-600 hover:underline font-bold cursor-pointer flex items-center gap-1"><i data-lucide="line-chart" class="w-3 h-3"></i> ${analyte}</a>
+                    </td>`;
+                
+                pivot.dates.forEach(date => {
+                    const val = pivot.map[analyte][date] || 'NS';
+                    const css = val === 'NS' ? 'text-slate-400 italic' : 'text-slate-700 font-medium';
+                    let disp = val;
+                    if(val !== 'NS' && !val.endsWith('U')) disp = `<span class="text-blue-700 font-bold">${val}</span>`;
+                    bodyHtml += `<td class="px-4 py-2 border-b border-slate-100 whitespace-nowrap text-center ${css}">${disp}</td>`;
+                });
+                bodyHtml += `</tr>`;
+            });
+            tbody.innerHTML = bodyHtml;
+            setTimeout(() => lucide.createIcons({ root: tbody }), 10);
+        }
+
+        function displayCrossWellData(onlyMapped = false) {
+            document.getElementById('emptyDataState').classList.add('hidden');
+            document.getElementById('dataTable').classList.remove('hidden');
+            document.getElementById('tableTitle').innerHTML = `<i data-lucide="network" class="w-5 h-5 text-blue-600"></i> Site-Wide Snapshot`;
+            lucide.createIcons({ root: document.getElementById('tableTitle').parentElement });
+
+            const method = document.getElementById('bottomMethodSelect').value;
+            const thead = document.getElementById('dataTable').querySelector('thead');
+            const tbody = document.getElementById('dataTableBody');
+
+            if (!method) {
+                tbody.innerHTML = `<tr><td class="p-8 text-center text-slate-500 italic">Please select an Active Method to view cross-well data.</td></tr>`;
+                thead.innerHTML = ''; return;
+            }
+
+            const selectedAnalytes = getSelectedAnalytes();
+
+            const validRows = state.data.filter(row => {
+                const rowMethod = normalizeMethod(getCSVValue(row, ['Analytical Method']));
+                const rowAnalyte = getCSVValue(row, ['Analyte']);
+                
+                const matchesMethod = method === 'All' || rowMethod === method;
+                const matchesAnalyte = !selectedAnalytes || selectedAnalytes.includes(rowAnalyte);
+                return matchesMethod && matchesAnalyte;
+            });
+
+            let wells = Array.from(new Set(validRows.map(r => getCSVValue(r, ['TestSite Name'])))).filter(Boolean).sort();
+            
+            if (onlyMapped) {
+                const mappedWells = Object.keys(state.markers);
+                wells = wells.filter(w => mappedWells.includes(w));
+            }
+
+            if (validRows.length === 0 || wells.length === 0) {
+                tbody.innerHTML = `<tr><td class="p-8 text-center text-slate-500 italic">No historical data found matching filters for these locations.</td></tr>`;
+                thead.innerHTML = ''; return;
+            }
+
+            const analytesSet = new Set();
+            const datesPerWell = {}; const dataMap = {}; 
+
+            validRows.forEach(row => {
+                const w = getCSVValue(row, ['TestSite Name']);
+                if(!w) return;
+                const fullDate = getCSVValue(row, ['Sample Date']) || '';
+                const dateOnly = fullDate.split(' ')[0];
+                if (!dateOnly) return;
+                
+                const analyte = getCSVValue(row, ['Analyte']) || 'Unknown';
+                const result = getCSVValue(row, ['Results', ' Results']) || '';
+                const unit = getCSVValue(row, ['Units', ' Units']) || '';
+                const qual = getCSVValue(row, ['Qualifier']) || '';
+
+                analytesSet.add(analyte);
+                if(!datesPerWell[w]) datesPerWell[w] = new Set();
+                datesPerWell[w].add(dateOnly);
+
+                if(!dataMap[analyte]) dataMap[analyte] = {};
+                if(!dataMap[analyte][w]) dataMap[analyte][w] = {};
+                dataMap[analyte][w][dateOnly] = `${result} ${unit} ${qual}`.replace(/\s+/g, ' ').trim();
+            });
+
+            const sortedAnalytes = customAnalyteSort(Array.from(analytesSet), method);
+
+            // Row 1 Header: Location ID
+            let headHtml = `<tr><th class="px-4 py-2 font-bold text-slate-700 border-b border-r border-slate-200 bg-slate-100 sticky left-0 z-20 shadow-[2px_0_4px_-1px_rgba(0,0,0,0.05)] align-bottom text-center">Location ID</th>`;
+            wells.forEach(w => {
+                const highlight = w === state.selectedWell ? 'bg-blue-100 text-blue-900' : 'bg-slate-100';
+                headHtml += `<th class="px-4 py-2 font-bold text-slate-700 border-b border-r border-slate-200 text-center ${highlight}">${w}</th>`;
+            });
+            headHtml += `</tr><tr>`;
+
+            // Row 2 Header: Latest Sampling Event
+            headHtml += `<th class="px-4 py-2 font-bold text-slate-700 border-b border-r border-slate-200 bg-slate-100 sticky left-0 z-20 shadow-[2px_0_4px_-1px_rgba(0,0,0,0.05)] align-bottom text-center">Latest Sampling Event</th>`;
+            wells.forEach(w => {
+                const highlight = w === state.selectedWell ? 'bg-blue-50' : 'bg-slate-50';
+                const wellDates = Array.from(datesPerWell[w] || []).sort((a,b)=>new Date(b)-new Date(a));
+                
+                let selDate = state.crossWellDates[w];
+                if (!selDate || !wellDates.includes(selDate)) {
+                    selDate = wellDates[0];
+                    state.crossWellDates[w] = selDate;
+                }
+
+                let options = wellDates.map(d => `<option value="${d}" ${d===selDate?'selected':''}>${d}</option>`).join('');
+                if(!options) options = `<option value="">No Data</option>`;
+
+                headHtml += `<th class="px-2 py-1 border-b border-r border-slate-200 text-center ${highlight}"><select class="text-xs border border-slate-300 rounded p-1 w-full max-w-[120px]" onchange="updateCrossWellDate('${w}', this.value)">${options}</select></th>`;
+            });
+            headHtml += `</tr>`;
+            thead.innerHTML = headHtml;
+
+            let bodyHtml = '';
+            sortedAnalytes.forEach(analyte => {
+                bodyHtml += `<tr class="hover:bg-blue-50 transition-colors">
+                    <td class="px-4 py-2 font-medium border-b border-r border-slate-200 bg-white sticky left-0 z-10 shadow-[2px_0_4px_-1px_rgba(0,0,0,0.05)]">
+                        <a href="#" onclick="openChartModal('${analyte}')" class="text-blue-600 hover:underline font-bold cursor-pointer flex items-center gap-1"><i data-lucide="line-chart" class="w-3 h-3"></i> ${analyte}</a>
+                    </td>`;
+                
+                wells.forEach(w => {
+                    const highlight = w === state.selectedWell ? 'bg-blue-50/30' : '';
+                    const selDate = state.crossWellDates[w];
+                    const val = (dataMap[analyte][w] && dataMap[analyte][w][selDate]) ? dataMap[analyte][w][selDate] : 'NS';
+                    const css = val === 'NS' ? 'text-slate-400 italic' : 'text-slate-700 font-medium';
+                    
+                    let disp = val;
+                    if(val !== 'NS' && !val.endsWith('U')) disp = `<span class="text-blue-700 font-bold">${val}</span>`;
+                    
+                    bodyHtml += `<td class="px-4 py-2 border-b border-slate-100 whitespace-nowrap text-center ${css} ${highlight}">${disp}</td>`;
+                });
+                bodyHtml += `</tr>`;
+            });
+            tbody.innerHTML = bodyHtml;
+            setTimeout(() => lucide.createIcons({ root: tbody }), 10);
+        }
+
+        // --- Chart.js Integration ---
+        window.openChartModal = function(analyte) {
+            const method = document.getElementById('bottomMethodSelect').value;
+            const viewMode = document.getElementById('viewModeSelect').value;
+            const isCrossWell = viewMode !== 'location';
+            
+            // If in cross well, plot all site wells. If single well, plot just the selected well.
+            let wellsToPlot = isCrossWell ? Array.from(state.uniqueWells).sort() : [state.selectedWell];
+            if (viewMode === 'mapped') {
+                const mappedWells = Object.keys(state.markers);
+                wellsToPlot = wellsToPlot.filter(w => mappedWells.includes(w));
+            }
+
+            const ctx = document.getElementById('chartCanvas').getContext('2d');
+            if (activeChart) activeChart.destroy();
+
+            const datasets = [];
+            const colors = ['#2563eb', '#dc2626', '#16a34a', '#d97706', '#9333ea', '#0891b2', '#be123c', '#15803d', '#f43f5e', '#0ea5e9'];
+
+            const allDatesSet = new Set();
+            const preProcessedData = {};
+            let universalUnit = '';
+
+            wellsToPlot.forEach((w, i) => {
+                const rowData = state.data.filter(r => {
+                    const rW = getCSVValue(r, ['TestSite Name']);
+                    const rM = normalizeMethod(getCSVValue(r, ['Analytical Method']));
+                    const rA = getCSVValue(r, ['Analyte']);
+                    return rW === w && rA === analyte && (method === 'All' || rM === method);
+                });
+
+                if(rowData.length === 0) return;
+
+                const points = [];
+                rowData.forEach(r => {
+                    const date = (getCSVValue(r, ['Sample Date']) || '').split(' ')[0];
+                    const rawVal = getCSVValue(r, ['Results', ' Results']);
+                    const val = parseFloat(rawVal);
+                    
+                    if(!universalUnit) {
+                        const u = getCSVValue(r, ['Units', ' Units']);
+                        if (u) universalUnit = u.trim();
+                    }
+
+                    if(!isNaN(val) && date) {
+                        points.push({ date: date, val: val });
+                        allDatesSet.add(date);
+                    }
+                });
+
+                if(points.length > 0) preProcessedData[w] = { color: colors[i % colors.length], points: points };
+            });
+
+            // Sort universal x-axis labels
+            const sortedDates = Array.from(allDatesSet).sort((a,b) => new Date(a) - new Date(b));
+
+            // Map data to universal axis
+            Object.keys(preProcessedData).forEach(w => {
+                const dataMap = {};
+                preProcessedData[w].points.forEach(p => dataMap[p.date] = p.val);
+                
+                datasets.push({
+                    label: w,
+                    data: sortedDates.map(d => dataMap[d] !== undefined ? dataMap[d] : null),
+                    borderColor: preProcessedData[w].color,
+                    backgroundColor: preProcessedData[w].color,
+                    tension: 0.1,
+                    spanGaps: true,
+                    pointRadius: 4,
+                    pointHoverRadius: 6
+                });
+            });
+
+            activeChart = new Chart(ctx, {
+                type: 'line',
+                data: { labels: sortedDates, datasets: datasets },
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: {
+                        title: { display: true, text: `${analyte} Concentration Over Time${isCrossWell ? ' (Site-Wide)' : ''}`, font: { size: 16 } },
+                        tooltip: { 
+                            mode: 'index', 
+                            intersect: false,
+                            callbacks: {
+                                label: function(context) {
+                                    return `${context.dataset.label}: ${context.parsed.y} ${universalUnit}`;
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        y: { beginAtZero: true, title: { display: true, text: `Concentration ${universalUnit ? `(${universalUnit})` : ''}` } },
+                        x: { title: { display: true, text: 'Sample Date' } }
+                    }
+                }
+            });
+
+            const modal = document.getElementById('chartModal');
+            modal.style.display = 'flex'; void modal.offsetWidth;
+            modal.classList.replace('opacity-0', 'opacity-100');
+            document.getElementById('chartModalContent').classList.replace('scale-95', 'scale-100');
+        };
+
+        window.closeChartModal = function() {
+            const modal = document.getElementById('chartModal');
+            modal.classList.replace('opacity-100', 'opacity-0');
+            document.getElementById('chartModalContent').classList.replace('scale-100', 'scale-95');
+            setTimeout(() => { modal.style.display = 'none'; }, 200);
+        };
+
+        // --- Exports & Session Management ---
+
+        // Load an image src to a decoded HTMLImageElement
+        function _loadImg(src) {
+            return new Promise((res, rej) => {
+                const img = new Image();
+                img.onload = () => res(img);
+                img.onerror = () => rej(new Error('Image load failed'));
+                img.src = src;
+            });
+        }
+
+        function _roundRect(ctx, x, y, w, h, r) {
+            r = Math.min(r, w / 2, h / 2);
+            ctx.beginPath();
+            ctx.moveTo(x + r, y);
+            ctx.arcTo(x + w, y,     x + w, y + h, r);
+            ctx.arcTo(x + w, y + h, x,     y + h, r);
+            ctx.arcTo(x,     y + h, x,     y,     r);
+            ctx.arcTo(x,     y,     x + w, y,     r);
+            ctx.closePath();
+        }
+
+        // Composite the WHOLE base map plus every annotation onto a canvas at
+        // native image resolution, then place it full-bleed into a PDF sized to
+        // the original page. Mirrors the reference tool's export model:
+        //   image-space size = css_size * calloutScale * 2^(-referenceZoom)
+        async function generatePDF() {
+            if (!state.mapReady) return showToast('Upload a site map first.', 'error');
+            if (!window.jspdf || !window.jspdf.jsPDF) return showToast('PDF library not loaded.', 'error');
+            const hasH2C = typeof window.html2canvas === 'function';
+            showToast('Compositing map for PDF...', 'info');
+
+            try {
+                const { jsPDF } = window.jspdf;
+
+                // Base image at native resolution
+                const baseImg = await _loadImg(state.mapImageSrc);
+                const imgW = baseImg.naturalWidth || baseImg.width;
+                const imgH = baseImg.naturalHeight || baseImg.height;
+
+                const canvas = document.createElement('canvas');
+                canvas.width = imgW; canvas.height = imgH;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(baseImg, 0, 0);
+
+                // CSS-px -> image-px factor (constant across zoom, keyed to fit zoom)
+                const sc = Math.pow(2, -(state.referenceZoom || 0));
+                const toPx = (lat, lng) => ({ x: lng, y: imgH - lat });
+
+                const labelsOn   = document.getElementById('labelToggle').checked;
+                const calloutKeys = Object.keys(state.callouts);
+
+                // 1) Leader lines (drawn first so markers/boxes sit on top)
+                ctx.save();
+                ctx.strokeStyle = '#64748b';
+                ctx.lineWidth = Math.max(1, 2 * sc);
+                ctx.setLineDash([4 * sc, 4 * sc]);
+                calloutKeys.forEach(name => {
+                    const m = state.markers[name];
+                    const c = state.callouts[name];
+                    if (!m || !c) return;
+                    const a = toPx(m.getLatLng().lat, m.getLatLng().lng);
+                    const b = toPx(c.marker.getLatLng().lat, c.marker.getLatLng().lng);
+                    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+                });
+                ctx.restore();
+
+                // 2) Well markers (dots) + name labels
+                Object.keys(state.markers).forEach(name => {
+                    const { x, y } = toPx(state.markers[name].getLatLng().lat, state.markers[name].getLatLng().lng);
+
+                    // 16px base dot, white ring — map-locked via pointScale × sc so
+                    // it matches the on-screen .well-dot size exactly.
+                    const r = 8 * state.pointScale * sc;
+                    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2);
+                    ctx.fillStyle = '#2563eb'; ctx.fill();
+                    ctx.lineWidth = 2 * state.pointScale * sc; ctx.strokeStyle = '#ffffff'; ctx.stroke();
+
+                    if (labelsOn) {
+                        const fs = state.labelFs * sc;
+                        ctx.font = `700 ${fs}px Inter, system-ui, sans-serif`;
+                        ctx.textAlign = 'center';
+                        const tw = ctx.measureText(name).width;
+                        const padX = fs * 0.6, padY = fs * 0.35;
+                        const boxW = tw + padX * 2, boxH = fs + padY * 2;
+                        const gap = 10 * sc;                 // tooltip offset [0,-10]
+                        const bottom = y - gap;
+                        ctx.fillStyle = '#1e293b';
+                        _roundRect(ctx, x - boxW / 2, bottom - boxH, boxW, boxH, 4 * sc);
+                        ctx.fill();
+                        ctx.fillStyle = '#ffffff';
+                        ctx.textBaseline = 'middle';
+                        ctx.fillText(name, x, bottom - boxH / 2);
+                    }
+                });
+
+                // 3) Callout boxes — capture the live DOM (full, un-scrolled) and
+                //    draw each into its image-space rectangle.
+                if (hasH2C) {
+                    for (const name of calloutKeys) {
+                        const c = state.callouts[name];
+                        const el = c.marker.getElement();
+                        if (!el) continue;
+                        const box = el.querySelector('.callout-scale-box') || el.firstElementChild;
+                        if (!box) continue;
+
+                        // Expand internal scroll + drop the CSS transform so the
+                        // capture is full-content at 1:1 layout size.
+                        const scrollers = box.querySelectorAll('.overflow-y-auto');
+                        const saved = [];
+                        scrollers.forEach(s => {
+                            saved.push([s, s.style.maxHeight, s.style.overflow, s.style.overflowY]);
+                            s.style.maxHeight = 'none'; s.style.overflow = 'visible'; s.style.overflowY = 'visible';
+                        });
+                        const prevTransform = box.style.transform;
+                        box.style.transform = 'none';
+
+                        const layoutW = box.offsetWidth;
+                        const layoutH = box.offsetHeight;
+
+                        let shot;
+                        try {
+                            shot = await html2canvas(box, { backgroundColor: null, scale: 2, logging: false, useCORS: true });
+                        } finally {
+                            box.style.transform = prevTransform;
+                            saved.forEach(([s, mh, ov, oy]) => { s.style.maxHeight = mh; s.style.overflow = ov; s.style.overflowY = oy; });
+                        }
+
+                        const { x, y } = toPx(c.marker.getLatLng().lat, c.marker.getLatLng().lng);
+                        const drawW = layoutW * state.calloutScale * sc;
+                        const drawH = layoutH * state.calloutScale * sc;
+                        ctx.drawImage(shot, x, y, drawW, drawH);
+                    }
+                } else if (calloutKeys.length) {
+                    showToast('Callout renderer unavailable — exporting without callout boxes.', 'error');
+                }
+
+                // 4) Page at original dimensions; image drawn full-bleed
+                const pageW = state.origPdfWidth  || imgW * 0.75;
+                const pageH = state.origPdfHeight || imgH * 0.75;
+                const doc = new jsPDF({
+                    orientation: pageW >= pageH ? 'landscape' : 'portrait',
+                    unit: 'pt', format: [pageW, pageH]
+                });
+                doc.addImage(canvas.toDataURL('image/png'), 'PNG', 0, 0, pageW, pageH, '', 'FAST');
+                const stamp = new Date().toISOString().slice(0, 10);
+                doc.save(`FDEP_Well_Map_${stamp}.pdf`);
+                showToast('PDF exported.', 'success');
+            } catch (err) {
+                console.error(err);
+                showToast('PDF export failed: ' + err.message, 'error');
+            }
+        }
+
+        function exportCSV() {
+            if (state.data.length === 0) return showToast('No data to export.', 'error');
+            const blob = new Blob([Papa.unparse(state.data)], { type: 'text/csv;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a'); link.href = url; link.download = 'Merged_FDEP_Data.csv';
+            link.click(); URL.revokeObjectURL(url);
+            showToast('Merged CSV exported.', 'success');
+        }
+
+        function exportHTML(asCleanViewer) {
+            if (!state.mapReady) return showToast('Upload a map before exporting.', 'error');
+            showToast('Generating export file...', 'info');
+
+            const clone = document.documentElement.cloneNode(true);
+
+            // Reset the transient zoom-scale var on the clone; the viewer recomputes
+            // it from referenceZoom on load. (--callout-scale / --label-fs are restored
+            // explicitly.) Prevents a stale first-paint scale.
+            clone.style.setProperty('--zoom-scale', '1');
+
+            clone.querySelector('#map').innerHTML = '<div id="mapPlaceholder" class="absolute inset-0 flex items-center justify-center bg-slate-200 z-[400] pointer-events-none transition-opacity duration-300"><div class="text-center text-slate-400"><i data-lucide="map" class="w-16 h-16 mx-auto mb-2 opacity-50"></i><p class="text-lg font-medium">Please upload a site map image or PDF to begin.</p></div></div>';
+            clone.querySelector('#dataTable').querySelector('thead').innerHTML = '';
+            clone.querySelector('#dataTableBody').innerHTML = '';
+            clone.querySelector('#toastContainer').innerHTML = '';
+            clone.querySelector('#dataTable').classList.add('hidden');
+            clone.querySelector('#emptyDataState').classList.remove('hidden');
+
+            const oldSession = clone.querySelector('#injected-session-state');
+            if (oldSession) oldSession.remove();
+
+            const markerData = Object.keys(state.markers).map(name => {
+                return { name: name, coords: state.markers[name].getLatLng() };
+            });
+
+            const sessionData = {
+                mapImageSrc: state.mapImageSrc,
+                data: state.data,
+                markers: markerData,
+                isCleanViewer: asCleanViewer,
+                activeMethod: document.getElementById('bottomMethodSelect').value,
+                activeAnalytes: getSelectedAnalytes(),
+                viewMode: document.getElementById('viewModeSelect').value,
+                crossWellDates: state.crossWellDates,
+                hideFloatingControls: asCleanViewer ? document.getElementById('hideFloatingControlsExport').checked : false,
+                // Callout / label sizing + layout so the viewer reproduces them
+                calloutsOn: document.getElementById('calloutToggle').checked,
+                labelsOn: document.getElementById('labelToggle').checked,
+                calloutScale: state.calloutScale,
+                pointScale: state.pointScale,
+                labelFs: state.labelFs,
+                calloutPositions: state.calloutPositions,
+                origPdfWidth: state.origPdfWidth,
+                origPdfHeight: state.origPdfHeight
+            };
+
+            const scriptTag = document.createElement('script');
+            scriptTag.id = 'injected-session-state';
+            scriptTag.textContent = `window.__SESSION_STATE__ = ${JSON.stringify(sessionData)};`;
+            clone.querySelector('head').appendChild(scriptTag);
+
+            const blob = new Blob(['<!DOCTYPE html>\n' + clone.outerHTML], { type: 'text/html;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a'); link.href = url;
+            link.download = asCleanViewer ? 'FDEP_Viewer.html' : 'FDEP_Session.html';
+            link.click(); URL.revokeObjectURL(url);
+            
+            showToast(asCleanViewer ? 'Viewer exported!' : 'Session exported!', 'success');
+        }
+
+        function restoreSession(session) {
+            if (session.hideFloatingControls) state.hideFloatingControls = true;
+
+            // ── Restore callout / label sizing + layout ──────────────
+            if (typeof session.calloutScale === 'number') {
+                applyCalloutScale(session.calloutScale);
+            }
+            if (typeof session.pointScale === 'number') {
+                applyPointScale(session.pointScale);
+            }
+            if (typeof session.labelFs === 'number') {
+                applyLabelSize(session.labelFs);
+            }
+            if (session.calloutPositions) state.calloutPositions = session.calloutPositions;
+            if (session.origPdfWidth)  state.origPdfWidth  = session.origPdfWidth;
+            if (session.origPdfHeight) state.origPdfHeight = session.origPdfHeight;
+
+            // Reflect saved toggle states (callouts render in the setTimeout below)
+            if (typeof session.calloutsOn === 'boolean') {
+                document.getElementById('calloutToggle').checked = session.calloutsOn;
+            }
+            if (typeof session.labelsOn === 'boolean') {
+                document.getElementById('labelToggle').checked = session.labelsOn;
+                document.getElementById('map').classList.toggle('hide-well-labels', !session.labelsOn);
+            }
+
+            if (session.isCleanViewer) {
+                state.isCleanViewer = true;
+                document.body.classList.add('viewer-mode');
+                // Ensure leaflet recalibrates dimensions when sidebar is removed
+                setTimeout(() => map.invalidateSize(), 50);
+            } else { 
+                document.getElementById('envStatus').textContent = 'Restored Session'; 
+            }
+
+            state.data = session.data;
+            if (session.mapImageSrc) loadMapOverlay(session.mapImageSrc);
+
+            state.data.forEach(row => {
+                const testSite = getCSVValue(row, ['TestSite Name']);
+                if (!testSite) return;
+                const fullDate = getCSVValue(row, ['Sample Date']) || '';
+                const analyte = getCSVValue(row, ['Analyte']) || '';
+                state.recordKeys.add(`${fullDate.trim()}|${analyte.trim()}|${testSite.trim()}`);
+                
+                state.uniqueWells.add(testSite.trim());
+                const rawMethod = getCSVValue(row, ['Analytical Method']);
+                if (rawMethod) state.uniqueMethods.add(normalizeMethod(rawMethod));
+            });
+
+            state.csvParsed = true;
+            populateWellDropdown();
+            populateMethodDropdown();
+
+            if(session.activeMethod) document.getElementById('bottomMethodSelect').value = session.activeMethod;
+            
+            if(session.viewMode) {
+                document.getElementById('viewModeSelect').value = session.viewMode;
+            } else if (session.isCrossWell !== undefined) {
+                document.getElementById('viewModeSelect').value = session.isCrossWell ? 'all' : 'location';
+            }
+            
+            if(session.crossWellDates) state.crossWellDates = session.crossWellDates;
+            
+            // Re-populate and restore analyte dropdown state before rendering tables
+            populateAnalyteDropdown();
+            if(session.activeAnalytes) {
+                document.getElementById('selectAllAnalytes').checked = false;
+                const checkboxes = document.querySelectorAll('.analyte-cb');
+                checkboxes.forEach(cb => {
+                    if (session.activeAnalytes.includes(cb.value)) cb.checked = true;
+                });
+                syncTableCGwState();
+                updateAnalyteButtonText();
+            }
+
+            if (session.markers) {
+                // Wait slightly longer to ensure invalidateSize() has completed before plotting relative markers
+                setTimeout(() => {
+                    session.markers.forEach(m => placeWellOnMap(m.coords, m.name));
+                    if(document.getElementById('calloutToggle').checked) refreshCallouts();
+                    renderActiveTable(); // Ensure loaded state aligns with table
+                }, 200);
+            }
+
+            if (!session.isCleanViewer) {
+                document.getElementById('csvStatus').classList.remove('hidden');
+                document.getElementById('csvCount').textContent = state.data.length.toLocaleString();
+            }
+        }
+    </script>
+</body>
+</html>
